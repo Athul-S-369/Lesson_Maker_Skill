@@ -12,6 +12,7 @@ import base64
 import html
 import os
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import httpx
@@ -232,20 +233,48 @@ def wikipedia_search(query: str) -> list[dict]:
 
 # ---------------- command line (used by the research agents) ----------------
 def main(argv: list[str]) -> int:
-    """python -m app.scraper fetch <url> [--max N] [--query "<topic>"] | search "<query>" | wiki "<query>"  -> JSON on stdout.
-    With --query, a page longer than --max keeps the passages that match the query instead of its first N characters."""
+    """python -m app.scraper fetch <url> [--max N] [--query "<topic>"] [--save <dir>] | transcript <video_id> [--save <dir>]
+                             | search "<query>" | wiki "<query>"  -> JSON on stdout.
+    With --query, a page longer than --max keeps the passages that match the query instead of its first N characters.
+    With --save <dir>, the text is written to <dir>/<name>.txt and the JSON carries `text_file` instead of the text, so an
+    agent never has to re-type a page (that was the slowest part of the research phase)."""
+    import hashlib
     import json
-    if len(argv) < 2 or argv[0] not in ("fetch", "search", "wiki"):
+    if len(argv) < 2 or argv[0] not in ("fetch", "search", "wiki", "transcript"):
         print(main.__doc__)
         return 2
     cmd, arg = argv[0], argv[1]
+    save = Path(argv[argv.index("--save") + 1]) if "--save" in argv else None
+
+    def saved(name: str, text: str) -> str:
+        save.mkdir(parents=True, exist_ok=True)
+        p = save / (hashlib.sha1(name.encode("utf-8")).hexdigest()[:10] + ".txt")
+        p.write_text(text, encoding="utf-8")
+        return str(p)
     try:
-        if cmd == "fetch":
+        if cmd == "transcript":
+            from . import research
+            text = research.fetch_transcript(arg) or ""
+            out = {"video_id": arg, "ok": bool(text), "chars": len(text)}
+            if text and save:
+                out["transcript_file"] = saved("tr:" + arg, text)
+            elif text:
+                out["transcript"] = text
+            else:
+                out["error"] = "no captions available (or youtube-transcript-api is not installed)"
+        elif cmd == "fetch":
             cap = int(argv[argv.index("--max") + 1]) if "--max" in argv else TEXT_CAP
             query = argv[argv.index("--query") + 1] if "--query" in argv else ""
             page = fetch_page(arg, query, cap)
-            out = ({"url": arg, "ok": True, **{**page, "chars": len(page["text"])}} if page
-                   else {"url": arg, "ok": False, "error": "could not fetch or extract (blocked, non-HTML, private address or empty)"})
+            if page and save:
+                page = {**{k: v for k, v in page.items() if k != "text"}, "text_file": saved(arg, page["text"]), "chars": len(page["text"]),
+                        "snippet": re.sub(r"\s+", " ", page["text"][:300])}
+                out = {"url": arg, "ok": True, **page}
+            else:
+                out = ({"url": arg, "ok": True, **{**page, "chars": len(page["text"])}} if page
+                       else {"url": arg, "ok": False, "error": "could not fetch or extract (blocked, non-HTML, private address or empty)"})
+            if not page:
+                out = {"url": arg, "ok": False, "error": "could not fetch or extract (blocked, non-HTML, private address or empty)"}
         elif cmd == "search":
             out = {"query": arg, "results": bing_search(arg)}
         else:
